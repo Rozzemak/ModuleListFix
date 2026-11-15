@@ -256,6 +256,64 @@ static DWORD WINAPI watchdogThread(LPVOID)
     return 0;
 }
 
+// Optional: keep loading whatever used to occupy the single \"load this DLL from DllMain\"
+// slot. ModuleListFix.ini next to this DLL, one entry per line, either bare or as Load=name:
+//
+//   [ModuleListFix]
+//   Load=SomeOtherLoader.dll
+//
+// Relative names are resolved next to this DLL, using the same search flags ReShade uses.
+static void chainLoad()
+{
+    char ini[MAX_PATH];
+    sprintf(ini, "%s\\ModuleListFix.ini", g_dir);
+    if (GetFileAttributesA(ini) == INVALID_FILE_ATTRIBUTES)
+        return;
+
+    FILE *f = fopen(ini, "r");
+    if (!f)
+    {
+        L("chain: cannot open %s\n", ini);
+        return;
+    }
+
+    char line[512];
+    while (fgets(line, sizeof(line), f))
+    {
+        char *s = line;
+        while (*s == ' ' || *s == '\t')
+            ++s;
+        if (*s == 0 || *s == ';' || *s == '#' || *s == '[')
+            continue;
+
+        char *nl = strpbrk(s, "\r\n");
+        if (nl)
+            *nl = 0;
+
+        char *eq = strchr(s, '=');
+        char *name = eq ? eq + 1 : s;
+        while (*name == ' ' || *name == '\t')
+            ++name;
+        size_t len = strlen(name);
+        while (len && (name[len - 1] == ' ' || name[len - 1] == '\t'))
+            name[--len] = 0;
+        if (len == 0)
+            continue;
+
+        char full[MAX_PATH];
+        if (strchr(name, ':') || strchr(name, '\\'))
+            sprintf(full, "%s", name);
+        else
+            sprintf(full, "%s\\%s", g_dir, name);
+
+        if (LoadLibraryExA(full, nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS))
+            L("chain: loaded %s\n", full);
+        else
+            L("chain: failed to load %s (error %lu)\n", full, (unsigned long)GetLastError());
+    }
+    fclose(f);
+}
+
 static void selfTest()
 {
     HMODULE mods[512];
@@ -311,6 +369,7 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID)
             L("=== attach pid=%lu module=%s\n", (unsigned long)GetCurrentProcessId(), ansi);
             selfTest();
             CreateThread(nullptr, 0, watchdogThread, nullptr, 0, nullptr);
+            chainLoad();
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {

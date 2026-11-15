@@ -29,6 +29,31 @@ Pick the DLL that matches the game: **x64** for any 64-bit game (nearly all of t
 
 To disable it later: delete the DLL, or remove the `LoadFromDllMain` line. A missing file only logs a harmless `126` in `ReShade.log`.
 
+### If another DLL already uses that slot
+
+`LoadFromDllMain` is not single-valued: ReShade parses it as a list and also appends repeated keys, so put both in and let ModuleListFix go first (it has to patch before the other DLL runs):
+
+```ini
+LoadFromDllMain=TheirLoader.dll,ModuleListFix.dll
+```
+
+which is the same as:
+
+```ini
+[ADDON]
+LoadFromDllMain=TheirLoader.dll
+LoadFromDllMain=ModuleListFix.dll
+```
+
+If the host only has a single slot, ModuleListFix can chain-load the displaced DLL itself. Create `ModuleListFix.ini` next to `ModuleListFix.dll`:
+
+```ini
+[ModuleListFix]
+Load=TheirLoader.dll
+```
+
+One entry per line, bare name or `Load=name`, relative to the DLL's folder (an absolute path also works). Entries are loaded **after** the patch is installed, with the same search flags ReShade uses. Failures are logged, not fatal.
+
 ### Any other host
 
 Anything else that needs module enumeration works the same way: `LoadLibrary` this DLL early from a proxy DLL you already control, before the dependent component initialises.
