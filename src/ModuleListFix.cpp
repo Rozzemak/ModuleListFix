@@ -87,9 +87,48 @@ static void toAnsi(const wchar_t *w, char *out, int cb)
 
 // Walks the PEB loader lists directly. Works where the kernel32 helper does not, because
 // it touches no API that the hiding layer may have broken.
+static PEB_LAYOUT *currentPeb()
+{
+#if defined(_M_X64)
+    return (PEB_LAYOUT *)__readgsqword(0x60);
+#elif defined(_M_IX86)
+    return (PEB_LAYOUT *)__readfsdword(0x30);
+#else
+#error Unsupported architecture
+#endif
+}
+
+// Writes an absolute jump to 'target' at 'p' (12 bytes on x64, 7 bytes on x86).
+static void writePatch(unsigned char *p, void *target)
+{
+#if defined(_M_X64)
+    p[0] = 0x48;
+    p[1] = 0xB8;
+    unsigned long long t = (unsigned long long)target;
+    memcpy(p + 2, &t, 8);
+    p[10] = 0xFF;
+    p[11] = 0xE0;
+#else
+    p[0] = 0xB8;
+    unsigned long t = (unsigned long)target;
+    memcpy(p + 1, &t, 4);
+    p[5] = 0xFF;
+    p[6] = 0xE0;
+#endif
+}
+
+static bool isPatched(const unsigned char *p)
+{
+#if defined(_M_X64)
+    return p[0] == 0x48 && p[1] == 0xB8;
+#else
+    return p[0] == 0xB8;
+#endif
+}
+
 static int walkModules(HMODULE *out, int maxOut, const char *tag)
 {
-    PEB_LAYOUT *peb = (PEB_LAYOUT *)__readgsqword(0x60);
+    PEB_LAYOUT *peb = currentPeb();
     if (!peb || !peb->LoaderData)
     {
         L("%s: no PEB/Ldr\n", tag);
@@ -151,8 +190,7 @@ static bool patchOne(HMODULE mod, const char *name)
     unsigned char *p = (unsigned char *)GetProcAddress(mod, name);
     if (!p) return false;
 
-    unsigned char expect[2] = {0x48, 0xB8};
-    if (memcmp(p, expect, 2) == 0)
+    if (isPatched(p))
     {
         L("patch: %s already installed at %p\n", name, (void *)p);
         return true;
@@ -165,13 +203,7 @@ static bool patchOne(HMODULE mod, const char *name)
         return false;
     }
 
-    // mov rax, <hook>; jmp rax
-    unsigned long long target = (unsigned long long)&EnumProcessModulesHook;
-    p[0] = 0x48;
-    p[1] = 0xB8;
-    memcpy(p + 2, &target, 8);
-    p[10] = 0xFF;
-    p[11] = 0xE0;
+    writePatch(p, (void *)&EnumProcessModulesHook);
 
     VirtualProtect(p, 16, old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, 16);
@@ -209,17 +241,12 @@ static DWORD WINAPI watchdogThread(LPVOID)
         for (int i = 0; i < g_patchCount; i++)
         {
             unsigned char *p = g_patchSites[i];
-            if (p && !(p[0] == 0x48 && p[1] == 0xB8))
+            if (p && !isPatched(p))
             {
                 DWORD old = 0;
                 if (!VirtualProtect(p, 16, PAGE_EXECUTE_READWRITE, &old))
                     continue;
-                unsigned long long target = (unsigned long long)&EnumProcessModulesHook;
-                p[0] = 0x48;
-                p[1] = 0xB8;
-                memcpy(p + 2, &target, 8);
-                p[10] = 0xFF;
-                p[11] = 0xE0;
+                writePatch(p, (void *)&EnumProcessModulesHook);
                 VirtualProtect(p, 16, old, &old);
                 FlushInstructionCache(GetCurrentProcess(), p, 16);
                 L("watchdog: re-patched site %d at %p\n", i, (void *)p);
