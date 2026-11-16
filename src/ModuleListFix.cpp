@@ -142,7 +142,17 @@ static int walkModules(HMODULE *out, int maxOut, const char *tag)
     while (e && e != head && n < maxOut && guard++ < MAX_MODULES * 2)
     {
         LDR_ENTRY_LAYOUT *m = (LDR_ENTRY_LAYOUT *)((char *)e - offsetof(LDR_ENTRY_LAYOUT, InLoadOrderLinks));
-        if (m->DllBase)
+        if (!m->DllBase)
+        {
+            e = e->Flink;
+            continue;
+        }
+        // The list in a protected process can contain a cycle or repeated entries; a caller that
+        // trusts the count then corrupts its own bookkeeping. Keep the first occurrence of each base.
+        bool dup = false;
+        for (int i = 0; i < n; ++i)
+            if (out[i] == (HMODULE)m->DllBase) { dup = true; break; }
+        if (!dup)
             out[n++] = (HMODULE)m->DllBase;
         e = e->Flink;
     }
@@ -165,6 +175,17 @@ static BOOL WINAPI EnumProcessModulesHook(HANDLE hProcess, HMODULE *mods, DWORD 
 
     HMODULE list[MAX_MODULES];
     int walked = walkModules(list, MAX_MODULES, "hook");
+
+    DWORD totalBytes = (DWORD)((walked > 0 ? walked : 0) * (DWORD)sizeof(HMODULE));
+
+    // Query call (cb == 0): report the real size. Returning 0 here makes callers that size their
+    // buffer first spin forever, which is exactly what a protected process's tools do.
+    if (cb == 0 || mods == nullptr)
+    {
+        if (needed) *needed = totalBytes;
+        L("call %ld: cb=%lu walked=%d (query, needed=%lu)\n", (long)g_callCount, (unsigned long)cb, walked, (unsigned long)totalBytes);
+        return TRUE;
+    }
 
     DWORD maxEntries = cb / (DWORD)sizeof(HMODULE);
     DWORD out = (DWORD)(walked > 0 ? walked : 0);
@@ -314,6 +335,15 @@ static void chainLoad()
     fclose(f);
 }
 
+static DWORD WINAPI chainThread(LPVOID)
+{
+    // Never call LoadLibrary from inside DllMain: the loader lock is held here, and a chained
+    // DLL that initialises its own threads/proxies deadlocks the host that loaded us.
+    Sleep(250);
+    __try { chainLoad(); } __except (EXCEPTION_EXECUTE_HANDLER) { L("chain: exception\n"); }
+    return 0;
+}
+
 static void selfTest()
 {
     HMODULE mods[512];
@@ -369,7 +399,7 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD reason, LPVOID)
             L("=== attach pid=%lu module=%s\n", (unsigned long)GetCurrentProcessId(), ansi);
             selfTest();
             CreateThread(nullptr, 0, watchdogThread, nullptr, 0, nullptr);
-            chainLoad();
+            CreateThread(nullptr, 0, chainThread, nullptr, 0, nullptr);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
